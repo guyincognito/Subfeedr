@@ -31,7 +31,7 @@ sub start {
                 my $feeds = shift;
                 for my $feed (map JSON::decode_json($_), @$feeds) {
                     next if $feed->{next_fetch} && $feed->{next_fetch} > time;
-                    $self->work_url($feed->{url});
+                    $self->work_url($feed);
                 }
             }
         });
@@ -45,105 +45,134 @@ sub start {
 }
 
 sub work_url {
-    my($self, $url) = @_;
-    warn "Polling $url\n";
+    my($self, $feed) = @_;
+    my $url = $feed->{url};
+    my $sha1_feed = Digest::SHA::sha1_hex($feed->{topic});
+    my $etag;
+    my $etag_modified_cv = AE::cv;
 
-    Tatsumaki::HTTPClient->new->get($url, sub {
-        my $res = shift;
-        my $sha1 = Digest::SHA::sha1_hex($url);
+    Subfeedr::DataStore->new('feed_etag')
+        ->hget($sha1_feed, sub {
+        $etag = shift;
+        $etag_modified_cv->end;
+    });
+    $etag_modified_cv->begin( sub {
+        warn "Polling $url\n";
 
-        try {
-            my $feed = XML::Feed->parse(\$res->content) or die "Parsing feed ($url) failed";
+        my $req = HTTP::Request->new(GET => $url);
+        $req->header('If-None-Match' => $etag) if $etag;
+        my $http_client = Tatsumaki::HTTPClient->new;
+        $http_client->request($req, sub {
+            my $res = shift;
 
-            my @new;
-            my $db_entries = [];
-            my $cv = AE::cv;
-            $cv->begin(sub { $self->notify($sha1, $url, $feed, $db_entries) if @$db_entries });
+            unless (res->code() == 304) {
+                my $sha1 = Digest::SHA::sha1_hex($url);
 
-            for my $entry ($feed->entries) {
-                next unless $entry->id;
-                $cv->begin;
+                try {
+                    my $feed = XML::Feed->parse(\$res->content) or die "Parsing feed ($url) failed";
+                    my $feed_etag = $res->header('ETag');
+                    $feed_etag = '' unless $feed_etag;
 
-                my $entry_sha = Digest::SHA::sha1_hex($entry->id);
-                my $key = join ".", $sha1, $entry_sha;
+                    my @new;
 
-                my $json = JSON::encode_json({
-                    sha1 => $entry_sha,
-                    feed => $sha1,
-                    id   => $entry->id,
-                    content => $entry->content->body
-                });
-
-                my $sha_json = Digest::SHA::sha1_hex($json);
-                Subfeedr::DataStore->new('entry')->get($key, sub {
-                    my $v = $_[0] ? Digest::SHA::sha1_hex(shift) : undef;
-                    if (!$v or $v ne $sha_json) {
+                    for my $entry ($feed->entries) {
+                        next unless $entry->id;
                         push @new, $entry;
-                        push @$db_entries, {
-                            key => $key,
-                            json => $json,
-                            entry => $entry,
-                        };
-                        #Subfeedr::DataStore->new('entry')->set($key, $json);
                     }
-                    $cv->end;
-                });
+                    my $time = Time::HiRes::gettimeofday;
+                    $self->notify($sha1, $url, $feed, $feed_etag, $time, \@new) if @new;
+                } catch {
+                    warn "Fetcher ERROR: $_";
+                };
             }
-            $cv->end;
-        } catch {
-            warn "Fetcher ERROR: $_";
-        };
 
-        # TODO smart polling
-        my $time = Time::HiRes::gettimeofday + $FeedInterval;
-        $time += 60 * 60 if $res->is_error;
-        warn "Scheduling next poll for $url on $time\n";
+            # TODO smart polling
+            my $time = Time::HiRes::gettimeofday + $FeedInterval;
+            $time += 60 * 60 if $res->is_error;
+            warn "Scheduling next poll for $url on $time\n";
 
-        Subfeedr::DataStore->new('next_fetch')->set($sha1, $time);
-        Subfeedr::DataStore->new('feed')->set($sha1, JSON::encode_json({
-            sha1 => $sha1,
-            url  => "$url",
-            next_fetch => $time,
-        }));
+            Subfeedr::DataStore->new('next_fetch')->set($sha1, $time);
+            Subfeedr::DataStore->new('feed')->set($sha1, JSON::encode_json({
+                sha1 => $sha1,
+                url  => "$url",
+                next_fetch => $time,
+            }));
+        });
     });
 }
 
 sub notify {
-    my($self, $sha1, $url, $feed, $db_entries) = @_;
+    my($self, $sha1, $url, $feed, $feed_etag, $time, $new_entries) = @_;
 
     # assume that entries will only contain new updates from the feed
-    my $how_many = @$db_entries;
+    my $how_many = @$new_entries;
     warn "Found $how_many entries for $url\n";
-
-    my @new_entries = map ($_->{entry}, @$db_entries);
     my $payload = $self->post_payload($feed, \@new_entries);
-    my $mime_type = $feed->format =~ /RSS/ ? 'application/rss+xml' : 'application/atom+xml';
-
-    #Store entries in redis after subscribers have been processed.
-    my $subscriber_cv = AE::cv;
-    $subscriber_cv->begin ( sub {
-        for my $db_entry (@$db_entries) { 
-            Subfeedr::DataStore
-                ->new('entry')
-                ->set($db_entry->{key}, $db_entry->{json}); 
-        }
+    #Generate payload JSON
+    my $payload_json = JSON::encode_json({
+        payload => $payload,
+        etag => $feed_etag,
+        time => $time,
     });
+    my $mime_type = $feed->format =~ /RSS/ ? 'application/rss+xml' : 'application/atom+xml';
 
     Subfeedr::DataStore->new('subscription')->sort($sha1, get => 'subscriber.*', sub {
         my $subs = shift;
+        my $etag_cv = AE::cv;
+
+        $etag_cv->begin( sub {
+            Subfeedr::DataStore->new('feed_etag')
+                ->hset($sha1, $feed_etag);
+        });
 
         for my $subscriber (map JSON::decode_json($_), @$subs) {
-            $subscriber_cv->begin;
+            $etag_cv->begin;
             my $subname = $subscriber->{sha1};
-            my $subscriber_db_entries = [];
             my $total_payload;
             my $list_length;
 
             #remove previous subscriber timer
             undef $subscriber_timer{$subname};
 
-            #Try to post payload to subscriber
             my $payload_cv = AE::cv;
+
+            #Generate payload to post and add to DB
+            Subfeedr::DataStore
+                ->new('subscriber_payload')
+                ->rpush($subname, $payload_json, sub {
+                #Update the time index for the subscriber itself
+                $subscriber->{time_updated} = $time;
+                Subfeedr::DataStore->new('subscriber')->set($subname, JSON::encode_json($subscriber), sub {
+                    $etag_cv->end;
+                    Subfeedr::DataStore
+                        ->new('subscriber_payload')
+                        ->llen($subname, sub {
+                        $list_length = shift;
+                        --$list_length;
+                        Subfeedr::DataStore
+                            ->new('subscriber_payload')
+                            ->lrange($subname, 0, $list_length, sub {
+                                my $payloads = shift;
+                                my $payload_json = JSON::decode_json($payloads->[0]);
+                                my $payload_object = XML::Smart
+                                    ->new($payload_json->{payload});
+                                #Assuming ATOM format
+                                #TODO: handle RSS format: probably ->{channel}{item}
+                                my $entries = $payload_object->{feed}{entry};
+                                for my $idx (1 .. $list_length) {
+                                    my $next_payload_json = JSON::decode_json($payloads->[$idx]);
+                                    my $next_payload_object 
+                                        = XML::Smart->new($next_payload_json->{payload});
+                                    push @$entries, @{$next_payload_object->{feed}{entry}};
+                                }
+                                $total_payload = $payload_object->data;
+                                $payload_cv->end;
+                        }); 
+                    });
+                });
+            });
+
+            #Try to post payload to subscriber
             $payload_cv->begin( sub {
                 my $hmac = Digest::SHA::hmac_sha1_hex(
                 $total_payload, $subscriber->{secret});
@@ -183,67 +212,7 @@ sub notify {
                     });
                 };
             });
-
-            my $entry_cv = AE::cv;
-
-            #Generate payload to post and add to DB
-            $entry_cv->begin( sub {
-                my @subscriber_entries = map ($_->{entry}, @$subscriber_db_entries);
-                my $subscriber_payload = $self->post_payload($feed, \@subscriber_entries);
-                Subfeedr::DataStore
-                    ->new('subscriber_payload')
-                    ->rpush($subname, $subscriber_payload, sub {
-                    for my $subscriber_db_entry (@$subscriber_db_entries) {
-                        Subfeedr::DataStore->new("entry_$subname")
-                            ->set($subscriber_db_entry->{key}, $subscriber_db_entry->{json});
-                    }
-                    Subfeedr::DataStore
-                        ->new('subscriber_payload')
-                        ->llen($subname, sub {
-                        $list_length = shift;
-                        --$list_length;
-                        Subfeedr::DataStore
-                            ->new('subscriber_payload')
-                            ->lrange($subname, 0, $list_length, sub {
-                                my $payloads = shift;
-                                my $payload_object = XML::Smart->new($payloads->[0]);
-                                #Assuming ATOM format
-                                #TODO: handle RSS format
-                                my $entries = $payload_object->{feed}{entry};
-                                for my $idx (1 .. $list_length) {
-                                    my $next_payload_object 
-                                        = XML::Smart->new($payloads->[$idx]);
-                                    push @$entries, @{$next_payload_object->{feed}{entry}};
-                                }
-                                $total_payload = $payload_object->data;
-                                $payload_cv->end;
-                        }); 
-                    });
-                });
-            });
-
-            #Calculate subscriber's new entries and add to db for seen entries
-            for my $db_entry (@$db_entries) { 
-                $entry_cv->begin;
-                my $sha_json = Digest::SHA::sha1_hex($db_entry->{json});
-                Subfeedr::DataStore->new("entry_$subname")->get($db_entry->{key}, sub {
-                    my $v = $_[0] ? Digest::SHA::sha1_hex(shift) : undef;
-                    if (!$v or $v ne $sha_json) {
-                        push @$subscriber_db_entries, {
-                            key => $db_entry->{key},
-                            json => $db_entry->{json},
-                            entry => $db_entry->{entry},
-                        };
-                        #Subfeedr::DataStore->new("entry_$subname")
-                        #    ->set($db_entry->{key}, $db_entry->{json});
-                    }
-                    $entry_cv->end;
-                });
-            }
-            $entry_cv->end;
-            $subscriber_cv->end;
         }
-        $subscriber_cv->end;
     });
 }
 

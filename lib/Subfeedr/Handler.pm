@@ -11,6 +11,7 @@ use URI;
 use MIME::Base64;
 use Subfeedr::Worker;
 use Subfeedr::DataStore;
+use Time::HiRes;
 
 sub get {
     my $self = shift;
@@ -120,6 +121,7 @@ sub subscribe {
         # NOTE only support sync for now
         Tatsumaki::HTTPClient->new->get($uri, $self->async_cb(sub {
             my $res = shift;
+            my $time = Time::HiRes::gettimeofday;
             if ($res->is_success && $res->content eq $challenge) {
                 Subfeedr::DataStore->new('subscriber')->set($sha1_cb, JSON::encode_json({
                     sha1 => $sha1_cb,
@@ -127,13 +129,32 @@ sub subscribe {
                     secret => $secret,
                     verify_token => $token,
                     lease_seconds => $lease_seconds,
+                    time_updated => $time,
                 }));
                 Subfeedr::DataStore->new('subscription')->sadd($sha1_feed, $sha1_cb);
                 Subfeedr::DataStore->new('known_feed')->sadd('set', $sha1_feed);
+
                 Subfeedr::DataStore->new('feed')->set($sha1_feed, JSON::encode_json({
                     sha1 => $sha1_feed,
                     url  => $topic,
-                }), sub { Tatsumaki::MessageQueue->instance('feed_fetch')->publish($topic) });
+                    }), sub { 
+                    my $cv = AE::cv;
+                    $cv->begin ( sub {
+                        Tatsumaki::MessageQueue
+                            ->instance('feed_fetch')
+                            ->publish($topic) 
+                    });
+                    Subfeedr::DataStore->new('feed_etag')
+                        ->hexists($sha1_feed, sub {
+                        my $exists = shift;
+                        if (!$exists) {
+                            Subfeedr::DataStore->new('feed_etag')
+                                ->hset($sha1_feed, '', sub { $cv->end })
+                        } else {
+                            $cv->end;
+                        }
+                    });
+                });
 
                 $self->response->code(204);
                 $self->finish('');
