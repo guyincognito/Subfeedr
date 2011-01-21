@@ -38,7 +38,7 @@ my %valid_ports = map { $_ => 1 } (80, 443, 4443, 8080 .. 8089, 8188, 8440, 8990
 sub is_valid_url {
     my $uri = URI->new(shift);
 
-    return unless $uri->scheme =~ m!^https?$!;
+    return unless $uri->scheme =~ m|^https?$|;
     return unless $valid_ports{$uri->port};
     return if $uri->fragment;
 
@@ -133,27 +133,15 @@ sub subscribe {
                 }));
                 Subfeedr::DataStore->new('subscription')->sadd($sha1_feed, $sha1_cb);
                 Subfeedr::DataStore->new('known_feed')->sadd('set', $sha1_feed);
-
-                Subfeedr::DataStore->new('feed')->set($sha1_feed, JSON::encode_json({
-                    sha1 => $sha1_feed,
-                    url  => $topic,
+                Subfeedr::DataStore->new('feed')->set($sha1_feed, 
+                    JSON::encode_json({ 
+                        sha1 => $sha1_feed,
+                        url => $topic,
                     }), sub { 
-                    my $cv = AE::cv;
-                    $cv->begin ( sub {
+                        my $cv = AE::cv;
                         Tatsumaki::MessageQueue
                             ->instance('feed_fetch')
-                            ->publish($topic) 
-                    });
-                    Subfeedr::DataStore->new('feed_etag')
-                        ->hexists($sha1_feed, sub {
-                        my $exists = shift;
-                        if (!$exists) {
-                            Subfeedr::DataStore->new('feed_etag')
-                                ->hset($sha1_feed, '', sub { $cv->end })
-                        } else {
-                            $cv->end;
-                        }
-                    });
+                            ->publish($topic);
                 });
 
                 $self->response->code(204);

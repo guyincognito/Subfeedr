@@ -16,6 +16,7 @@ use Digest::SHA;
 our $FeedInterval = $ENV{SUBFEEDR_INTERVAL} || 60 * 15;
 
 my %subscriber_timer;
+my %etag_cv;
 
 sub start {
     my $self = shift;
@@ -31,7 +32,7 @@ sub start {
                 my $feeds = shift;
                 for my $feed (map JSON::decode_json($_), @$feeds) {
                     next if $feed->{next_fetch} && $feed->{next_fetch} > time;
-                    $self->work_url($feed);
+                    $self->work_url($feed->{url});
                 }
             }
         });
@@ -40,33 +41,49 @@ sub start {
     my $mq = Tatsumaki::MessageQueue->instance('feed_fetch');
     $mq->poll("worker", sub {
         my $url = shift;
-        $self->work_url($url);
+        my $sha1 = Digest::SHA::sha1_hex($url);
+
+        $etag_cv{$sha1} = AE::cv;
+        $etag_cv{$sha1}->begin ( sub {
+            $self->work_url($url);
+        });
+
+        Subfeedr::DataStore->new('feed_etag')
+            ->hexists($sha1, 'etag', sub {
+            my $exists = shift;
+            if (!$exists) {
+                Subfeedr::DataStore->new('feed_etag')
+                    ->hset($sha1, 'etag', '', sub { 
+                    $etag_cv{$sha1}->end; 
+                });
+            } else {
+                $etag_cv{$sha1}->end;
+            }
+        });
     });
 }
 
 sub work_url {
-    my($self, $feed) = @_;
-    my $url = $feed->{url};
-    my $sha1_feed = Digest::SHA::sha1_hex($feed->{topic});
+    my($self, $url) = @_;
+    my $sha1_feed = Digest::SHA::sha1_hex($url);
     my $etag;
     my $etag_modified_cv = AE::cv;
 
     Subfeedr::DataStore->new('feed_etag')
-        ->hget($sha1_feed, sub {
+        ->hget($sha1_feed, 'etag', sub {
         $etag = shift;
         $etag_modified_cv->end;
     });
     $etag_modified_cv->begin( sub {
-        warn "Polling $url\n";
 
         my $req = HTTP::Request->new(GET => $url);
         $req->header('If-None-Match' => $etag) if $etag;
         my $http_client = Tatsumaki::HTTPClient->new;
         $http_client->request($req, sub {
             my $res = shift;
+            my $sha1 = Digest::SHA::sha1_hex($url);
 
-            unless (res->code() == 304) {
-                my $sha1 = Digest::SHA::sha1_hex($url);
+            unless ($res->code() == 304) {
 
                 try {
                     my $feed = XML::Feed->parse(\$res->content) or die "Parsing feed ($url) failed";
@@ -107,7 +124,7 @@ sub notify {
     # assume that entries will only contain new updates from the feed
     my $how_many = @$new_entries;
     warn "Found $how_many entries for $url\n";
-    my $payload = $self->post_payload($feed, \@new_entries);
+    my $payload = $self->post_payload($feed, $new_entries);
     #Generate payload JSON
     my $payload_json = JSON::encode_json({
         payload => $payload,
@@ -121,8 +138,9 @@ sub notify {
         my $etag_cv = AE::cv;
 
         $etag_cv->begin( sub {
+            warn "setting feed etag $feed_etag";
             Subfeedr::DataStore->new('feed_etag')
-                ->hset($sha1, $feed_etag);
+                ->hset($sha1, 'etag', $feed_etag);
         });
 
         for my $subscriber (map JSON::decode_json($_), @$subs) {
@@ -213,6 +231,7 @@ sub notify {
                 };
             });
         }
+        $etag_cv->end;
     });
 }
 

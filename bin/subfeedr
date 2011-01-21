@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
-use lib '/root/scripts/Subfeedr/lib';
+use lib '/root/Subfeedr/lib';
 
 #check if redis-server is up and running
 my $command = "pgrep redis-server > /dev/null";
