@@ -74,8 +74,8 @@ sub work_url {
         $etag = shift;
         $etag_modified_cv->end;
     });
+    
     $etag_modified_cv->begin( sub {
-
         my $req = HTTP::Request->new(GET => $url);
         $req->header('If-None-Match' => $etag) if $etag;
         my $http_client = Tatsumaki::HTTPClient->new;
@@ -140,7 +140,9 @@ sub notify {
         $etag_cv->begin( sub {
             warn "setting feed etag $feed_etag";
             Subfeedr::DataStore->new('feed_etag')
-                ->hset($sha1, 'etag', $feed_etag);
+                ->hset($sha1, 'etag', $feed_etag, sub { 
+                Subfeedr::DataStore->new('')->bgsave();
+            });
         });
 
         for my $subscriber (map JSON::decode_json($_), @$subs) {
@@ -161,6 +163,7 @@ sub notify {
                 #Update the time index for the subscriber itself
                 $subscriber->{time_updated} = $time;
                 Subfeedr::DataStore->new('subscriber')->set($subname, JSON::encode_json($subscriber), sub {
+                    Subfeedr::DataStore->new('')->bgsave();
                     $etag_cv->end;
                     Subfeedr::DataStore
                         ->new('subscriber_payload')
