@@ -3,12 +3,16 @@ use Moose;
 use AnyEvent::Redis;
 
 # Schema:
-#   known_feed.set:    Set of SHA1 for the known feeds
-#   next_fetch.{id}:   Next fetched time of feeds ({id} = SHA1 of URL)
-#   feed.{id}:         JSON object for the feed
-#   entry.{id}.{eid}:  SHA1 of entry body ({eid} = SHA1 of entry ID)
-#   subscription.set:  Set of SHA1 for the subscribers
-#   subscriber.{sid}:  JSON object for the subscriber ({sid} = SHA1 of callback URL)
+#   known_feed.set:             Set of SHA1 for the known feeds
+#   next_fetch.{id}:            Next fetched time of feeds ({id} = SHA1 of URL)
+#   feed.{id}:                  JSON object for the feed
+#   entry.{id}.{eid}:           SHA1 of entry body ({eid} = SHA1 of entry ID)
+#   subscription.set:           Set of SHA1 for the subscribers
+#   subscriber.{sid}:           JSON object for the subscriber ({sid} = SHA1 of callback URL)
+#   feed_etag.etag:             hash with sha1 of topic url as key and etag
+#                               header of last feed retrieval as value 
+#   subscriber_payload.{sid}    contains a list of payloads to be posted to the
+#                               subscriber ({sid} = SHA1 of callback URL)
 
 has prefix => (is => 'rw', isa => 'Str');
 
