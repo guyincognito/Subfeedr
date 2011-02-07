@@ -15,8 +15,12 @@ use Digest::SHA;
 
 our $FeedInterval = $ENV{SUBFEEDR_INTERVAL} || 60 * 15;
 
-my %subscriber_timer;
+my $subscriber_timer;
 my %etag_cv;
+my $subscriber_payload_list = {};
+
+#TODO: need to expire entries in this hash after sometime
+my $etag_info = {};
 
 sub start {
     my $self = shift;
@@ -66,175 +70,217 @@ sub start {
 sub work_url {
     my($self, $url) = @_;
     my $sha1_feed = Digest::SHA::sha1_hex($url);
-    my $etag;
-    my $etag_modified_cv = AE::cv;
 
-    Subfeedr::DataStore->new('feed_etag')
-        ->hget($sha1_feed, 'etag', sub {
-        $etag = shift;
-        $etag_modified_cv->end;
-    });
+    if (!$etag_info->{$sha1_feed}) {
+        $etag_info->{$sha1_feed} = {};
+    }
+    if (!$etag_info->{$sha1_feed}{etag}) {
+        $etag_info->{$sha1_feed}{etag} = '';
+    }
+
+    if (!$etag_info->{$sha1_feed}{prev_etag}) {
+        $etag_info->{$sha1_feed}{prev_etag} = '';
+    }
+
+    if (!$etag_info->{$sha1_feed}{range}) {
+        $etag_info->{$sha1_feed}{range} = {};
+    }
+
+    if (!$etag_info->{$sha1_feed}{seen}) {
+        $etag_info->{$sha1_feed}{seen} = {};
+    }
+
+    my $etag = $etag_info->{$sha1_feed}{etag};
+
+    my $req = HTTP::Request->new(GET => $url);
     
-    $etag_modified_cv->begin( sub {
-        my $req = HTTP::Request->new(GET => $url);
-        $req->header('If-None-Match' => $etag) if $etag;
-        my $http_client = Tatsumaki::HTTPClient->new;
-        $http_client->request($req, sub {
-            my $res = shift;
-            my $sha1 = Digest::SHA::sha1_hex($url);
+    #Need to develop start up routine to repopulate the package level variables from the db
+    #(We'll have to accept the possibility of posting repeated information if the hub goes down)
+    $req->header('If-None-Match' => $etag) if $etag;
+    $self->log("Setting If-None-Match to $etag");
+    my $http_client = Tatsumaki::HTTPClient->new;
+    $http_client->request($req, sub {
+        my $res = shift;
+        my $sha1 = Digest::SHA::sha1_hex($url);
 
-            unless ($res->code() == 304) {
+        unless ($res->code() == 304) {
+            try {
+                my $time = Time::HiRes::gettimeofday;
+                $self->log("Time in work_url is $time");
+                my $feed = XML::Feed->parse(\$res->content) or die "Parsing feed ($url) failed";
+                my $feed_etag = $res->header('ETag');
+                $feed_etag = '' unless $feed_etag;
+                my $key  = $etag . "_" . $feed_etag;
+                if ($etag_info->{$sha1_feed}{range}{$key}) {
+                    $self->log("Attempting to retrieve duplicate range If-None-Match: $etag, ETag: $feed_etag");
+                    return;
+                }
+                if ($etag_info->{$sha1_feed}{seen}{$etag}) {
+                    $self->log("Trying to use same If-None-Match for subsequent retrieval If-None-Match: $etag, ETag: $feed_etag");
+                    return;
+                }
+                $self->log("Old etag: $etag, New etag: $feed_etag");
 
-                try {
-                    my $feed = XML::Feed->parse(\$res->content) or die "Parsing feed ($url) failed";
-                    my $feed_etag = $res->header('ETag');
-                    $feed_etag = '' unless $feed_etag;
+                #Store the new values in package level variables
+                $etag_info->{$sha1_feed}{prev_etag} = $etag;
+                $etag_info->{$sha1_feed}{etag} = $feed_etag;
+                $etag_info->{$sha1_feed}{set_time} = $time;
 
-                    my @new;
+                #TODO: Need to remove these after a certain period of time
+                $etag_info->{$sha1_feed}{range}{$key} = 1;
+                $etag_info->{$sha1_feed}{seen}{$etag} = 1;
 
-                    for my $entry ($feed->entries) {
-                        next unless $entry->id;
-                        push @new, $entry;
-                    }
-                    my $time = Time::HiRes::gettimeofday;
-                    $self->notify($sha1, $url, $feed, $feed_etag, $time, \@new) if @new;
-                } catch {
-                    warn "Fetcher ERROR: $_";
-                };
-            }
+                my @new;
+                for my $entry ($feed->entries) {
+                    next unless $entry->id;
+                    push @new, $entry;
+                }
 
-            # TODO smart polling
-            my $time = Time::HiRes::gettimeofday + $FeedInterval;
-            $time += 60 * 60 if $res->is_error;
-            warn "Scheduling next poll for $url on $time\n";
+                my $entry_count = @new;
+                $self->log("In work_url, got $entry_count new entries");
+                my $payload = $self->post_payload($feed, \@new);
+                $etag_info->{$sha1_feed}{payload} = $payload;
+                my $etag_info_json = JSON::encode_json($etag_info);
 
-            Subfeedr::DataStore->new('next_fetch')->set($sha1, $time);
-            Subfeedr::DataStore->new('feed')->set($sha1, JSON::encode_json({
-                sha1 => $sha1,
-                url  => "$url",
-                next_fetch => $time,
-            }));
-        });
+                Subfeedr::DataStore->new('feed_etag_info')
+                    ->set($sha1, $etag_info_json, sub { 
+                        #$self->log("set etag_info $etag_info_json");
+                        Subfeedr::DataStore->new('')->bgsave();
+                });
+
+                $self->notify($sha1, $url, $feed, $feed_etag, $etag, $time, $payload, \@new) if @new;
+            } catch {
+                warn "Fetcher ERROR: $_";
+            };
+        } else {
+            $self->log("Feed not modified");
+        }
+
+        # TODO smart polling
+        my $time = Time::HiRes::gettimeofday + $FeedInterval;
+        $time += 60 * 60 if $res->is_error;
+        warn "Scheduling next poll for $url on $time\n";
+
+        Subfeedr::DataStore->new('next_fetch')->set($sha1, $time);
+        Subfeedr::DataStore->new('feed')->set($sha1, JSON::encode_json({
+            sha1 => $sha1,
+            url  => "$url",
+            next_fetch => $time,
+        }));
     });
 }
 
 sub notify {
-    my($self, $sha1, $url, $feed, $feed_etag, $time, $new_entries) = @_;
+    my($self, $sha1, $url, $feed, $feed_etag, $old_etag, $time, $payload, $new_entries) = @_;
 
     # assume that entries will only contain new updates from the feed
     my $how_many = @$new_entries;
-    warn "Found $how_many entries for $url\n";
-    my $payload = $self->post_payload($feed, $new_entries);
-    #Generate payload JSON
-    my $payload_json = JSON::encode_json({
-        payload => $payload,
+    $self->log("Found $how_many entries for $url If-None-Match:$old_etag and ETag:$feed_etag");
+
+    $self->log("Time in notify is $time");
+    my $payload_info = {
+        prev_etag => $old_etag,
         etag => $feed_etag,
-        time => $time,
-    });
+        payload => $payload,
+        set_time => $time,
+    };
+    $self->log("Time in payload_info->{set_time} is " . $payload_info->{set_time});
+
+    my $payload_info_json = JSON::encode_json($payload_info);
     my $mime_type = $feed->format =~ /RSS/ ? 'application/rss+xml' : 'application/atom+xml';
 
     Subfeedr::DataStore->new('subscription')->sort($sha1, get => 'subscriber.*', sub {
         my $subs = shift;
-        my $etag_cv = AE::cv;
-
-        $etag_cv->begin( sub {
-            warn "setting feed etag $feed_etag";
-            Subfeedr::DataStore->new('feed_etag')
-                ->hset($sha1, 'etag', $feed_etag, sub { 
-                Subfeedr::DataStore->new('')->bgsave();
-            });
-        });
 
         for my $subscriber (map JSON::decode_json($_), @$subs) {
-            $etag_cv->begin;
             my $subname = $subscriber->{sha1};
-            my $total_payload;
-            my $list_length;
+            
+            unless ($subscriber_payload_list->{$subname}) {
+                $subscriber_payload_list->{$subname} = [];
+            }
 
-            #remove previous subscriber timer
-            undef $subscriber_timer{$subname};
+            #Add payload to package level variable and db
+            push @{$subscriber_payload_list->{$subname}}, $payload_info;
+            my $pushed_payload_ct = @{$subscriber_payload_list->{$subname}};
+            $self->log("After pushing, now have $pushed_payload_ct for $subname\n");
 
-            my $payload_cv = AE::cv;
-
-            #Generate payload to post and add to DB
             Subfeedr::DataStore
                 ->new('subscriber_payload')
-                ->rpush($subname, $payload_json, sub {
-                #Update the time index for the subscriber itself
-                $subscriber->{time_updated} = $time;
-                Subfeedr::DataStore->new('subscriber')->set($subname, JSON::encode_json($subscriber), sub {
-                    Subfeedr::DataStore->new('')->bgsave();
-                    $etag_cv->end;
-                    Subfeedr::DataStore
-                        ->new('subscriber_payload')
-                        ->llen($subname, sub {
-                        $list_length = shift;
-                        --$list_length;
-                        Subfeedr::DataStore
-                            ->new('subscriber_payload')
-                            ->lrange($subname, 0, $list_length, sub {
-                                my $payloads = shift;
-                                my $payload_json = JSON::decode_json($payloads->[0]);
-                                my $payload_object = XML::Smart
-                                    ->new($payload_json->{payload});
-                                #Assuming ATOM format
-                                #TODO: handle RSS format: probably ->{channel}{item}
-                                my $entries = $payload_object->{feed}{entry};
-                                for my $idx (1 .. $list_length) {
-                                    my $next_payload_json = JSON::decode_json($payloads->[$idx]);
-                                    my $next_payload_object 
-                                        = XML::Smart->new($next_payload_json->{payload});
-                                    push @$entries, @{$next_payload_object->{feed}{entry}};
-                                }
-                                $total_payload = $payload_object->data;
-                                $payload_cv->end;
-                        }); 
-                    });
-                });
-            });
+                ->rpush($subname, $payload_info_json);
 
-            #Try to post payload to subscriber
-            $payload_cv->begin( sub {
-                my $hmac = Digest::SHA::hmac_sha1_hex(
-                $total_payload, $subscriber->{secret});
-                my $req = HTTP::Request->new(POST => $subscriber->{callback});
-                $req->content_type($mime_type);
-                $req->header('X-Hub-Signature' => "sha1=$hmac");
-                $req->content_length(length $total_payload);
-                $req->content($total_payload);
+            #TODO: Need to determine minimum safe interval time
+            unless ($subscriber_timer->{$subname}) {
+                $subscriber_timer->{$subname} = AE::timer 0, 2, sub {
+                    my $time = Time::HiRes::gettimeofday;
+                    my $idx = 0;
+                    foreach my $payload_info (@{$subscriber_payload_list->{$subname}}) {
+                        if ($payload_info->{set_time} < $time) {
+                            ++$idx;
+                        } else {
+                            last;
+                        }
+                    }
+                    unless ($idx) {
+                        return;
+                    }
+                    my $payload_object 
+                        = XML::Smart->new($subscriber_payload_list->{$subname}[0]{payload});
+                    #TODO: handle RSS format: probably ->{channel}{item}
+                    my $entries = $payload_object->{feed}{entry};
+                    for my $i (1 .. $idx - 1) {
+                        my $next_payload_object 
+                            = XML::Smart
+                                ->new($subscriber_payload_list->{$subname}[$i]{payload});
+                        push @$entries, @{$next_payload_object->{feed}{entry}};
+                    }
 
-                my $http_client = Tatsumaki::HTTPClient->new;
+                    #TODO: Need to add entry ids to a package level hash to detemrine whether
+                    #an entry has already been posted.  If so, return from the
+                    #function.  Will also need to expire these ids after some
+                    #time
+                    my $payload_data = $payload_object->data;
+                    my $hmac = Digest::SHA::hmac_sha1_hex(
+                        $payload_data, $subscriber->{secret});
+                    my $req = HTTP::Request
+                        ->new(POST => $subscriber->{callback});
+                    $req->content_type($mime_type);
+                    $req->header('X-Hub-Signature' => "sha1=$hmac");
+                    $req->content_length(length $payload_data);
+                    $req->content($payload_data);
 
-                #set a timer to post to the subscriber callback.  Try every 30
-                #seconds until we can successfully post to it.
-                $subscriber_timer{$subname} = AE::timer 0, 30, sub {
+                    my $http_client = Tatsumaki::HTTPClient->new;
                     $http_client->request($req, sub {
                         my $res = shift;
                         if ($res->is_error) {
-                            warn $res->status_line;
-                            warn $res->content;
+                            #TODO: Implement a backoff routine (say a package
+                            #level counter variable that returns from this
+                            #function until a certain period of time has passed
+                            $self->log("For " . $subscriber->{callback});
+                            $self->log($res->status_line . $res->content);
                         } else {
-                            #cancel the timer and empty the entry list for
-                            #this subscriber
+                            #remove payload(s) from package level list
+                            splice @{$subscriber_payload_list->{$subname}}, 0, $idx;
+                            my $spliced_payload_ct 
+                                = @{$subscriber_payload_list->{$subname}};
+                            $self->log("After splicing $idx elements, now have $spliced_payload_ct payloads for $subname\n");
+                            #Do the equivalent splice in backend
                             my $list_cv = AE::cv;
-                            $list_cv->begin(sub {
-                                undef $subscriber_timer{$subname};
+                            Subfeedr::DataStore
+                                ->new('subscriber_payload')
+                                ->ltrim($subname, $idx, -1, sub { 
+                                $self->log("Removed $idx elements from payload list");
                             });
-                            for (0 .. $list_length) {
-                                $list_cv->begin;
-                                Subfeedr::DataStore
-                                    ->new('subscriber_payload')
-                                    ->lpop($subname, sub { 
-                                    $list_cv->end;
-                                });
-                            }
-                            $list_cv->end;
+                            Subfeedr::DataStore
+                                ->new('subscriber_payload')
+                                ->llen($subname, sub { 
+                                my $length = shift;
+                                $self->log("Backend payload list has $length elements");
+                            });
                         }
                     });
                 };
-            });
+            }
         }
-        $etag_cv->end;
     });
 }
 
@@ -261,6 +307,13 @@ sub post_payload {
     utf8::encode($payload) if utf8::is_utf8($payload); # Ugh
 
     return $payload;
+}
+
+sub log {
+    my $self = shift;
+    my $message = shift;
+    open my $fh, ">>/tmp/subfeedr.log";
+    print $fh localtime() . ": $message\n";
 }
 
 1;
