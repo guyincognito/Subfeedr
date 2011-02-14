@@ -12,6 +12,10 @@ use MIME::Base64;
 use Subfeedr::Worker;
 use Subfeedr::DataStore;
 use Time::HiRes;
+use AnyEvent;
+
+my $publish_queue = {};
+my $publish_cv = {};
 
 sub get {
     my $self = shift;
@@ -57,13 +61,42 @@ sub publish {
         }
     }
 
+
+
     @urls = map URI->new($_)->canonical, @urls;
 
     for my $url (@urls) {
         my $sha1 = Digest::SHA::sha1_hex($url);
+        
         Subfeedr::DataStore->new('known_feed')->sismember('set', $sha1, $self->async_cb(sub {
             return unless $_[0];
-            Tatsumaki::MessageQueue->instance('feed_fetch')->publish($url);
+            my $pub_time = Time::HiRes::gettimeofday;
+            unless ($publish_queue->{$sha1}) {
+                $publish_queue->{$sha1} = [];
+            }
+            push @{$publish_queue->{$sha1}}, $pub_time;
+            my $publish_queue_ct = @{$publish_queue->{$sha1}};
+            unless ($publish_cv->{$sha1}) {
+                #Throttle publish requests to once every 2 seconds
+                $publish_cv->{$sha1} = AE::timer 0, 2, sub {
+                    my $timer_time = Time::HiRes::gettimeofday;
+                    my $idx = 0;
+                    foreach my $pub (@{$publish_queue->{$sha1}}) {
+                        if ($pub < $timer_time) {
+                            ++$idx;
+                        } else {
+                            last;
+                        }
+                    }
+                    unless ($idx) {
+                        return;
+                    }
+                    splice @{$publish_queue->{$sha1}}, 0, $idx;
+                    Tatsumaki::MessageQueue->instance('feed_fetch')->publish($url);
+                };
+
+            }
+            #Tatsumaki::MessageQueue->instance('feed_fetch')->publish($url);
         }));
     }
 

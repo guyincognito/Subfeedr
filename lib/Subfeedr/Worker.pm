@@ -18,9 +18,7 @@ our $FeedInterval = $ENV{SUBFEEDR_INTERVAL} || 60 * 15;
 my $subscriber_timer;
 my %etag_cv;
 my $subscriber_payload_list = {};
-
-#TODO: need to expire entries in this hash after sometime
-my $etag_info = {};
+my $etag_list = [];
 
 sub start {
     my $self = shift;
@@ -71,26 +69,10 @@ sub work_url {
     my($self, $url) = @_;
     my $sha1_feed = Digest::SHA::sha1_hex($url);
 
-    if (!$etag_info->{$sha1_feed}) {
-        $etag_info->{$sha1_feed} = {};
+    my $etag = '';
+    if (@$etag_list) {
+        $etag = $etag_list->[-1]{end_etag}
     }
-    if (!$etag_info->{$sha1_feed}{etag}) {
-        $etag_info->{$sha1_feed}{etag} = '';
-    }
-
-    if (!$etag_info->{$sha1_feed}{prev_etag}) {
-        $etag_info->{$sha1_feed}{prev_etag} = '';
-    }
-
-    if (!$etag_info->{$sha1_feed}{range}) {
-        $etag_info->{$sha1_feed}{range} = {};
-    }
-
-    if (!$etag_info->{$sha1_feed}{seen}) {
-        $etag_info->{$sha1_feed}{seen} = {};
-    }
-
-    my $etag = $etag_info->{$sha1_feed}{etag};
 
     my $req = HTTP::Request->new(GET => $url);
     
@@ -110,26 +92,23 @@ sub work_url {
                 my $feed = XML::Feed->parse(\$res->content) or die "Parsing feed ($url) failed";
                 my $feed_etag = $res->header('ETag');
                 $feed_etag = '' unless $feed_etag;
-                my $key  = $etag . "_" . $feed_etag;
-                if ($etag_info->{$sha1_feed}{range}{$key}) {
-                    $self->log("Attempting to retrieve duplicate range If-None-Match: $etag, ETag: $feed_etag");
-                    return;
+                #my $key  = $etag . "_" . $feed_etag;
+                push @$etag_list, {
+                    start_etag => $etag,
+                    end_etag => $feed_etag,
+                };
+                #TODO: Need to keep equivalent values in DB
+                if (@$etag_list > 1) {
+                    if ($etag_list->[-2]{end_etag} ne $etag_list->[-1]{start_etag}) {
+                        $self->log("INTEGRITY ERROR, original etag " . $etag_list->[-2]{end_etag} . " retrieved etag " . $etag_list->[-1]{start_etag});
+                        #pop the element off the end of the list and return
+                        pop @$etag_list;
+                        return;
+                    } else {
+                        shift @$etag_list;
+                    }
                 }
-                if ($etag_info->{$sha1_feed}{seen}{$etag}) {
-                    $self->log("Trying to use same If-None-Match for subsequent retrieval If-None-Match: $etag, ETag: $feed_etag");
-                    return;
-                }
-                $self->log("Old etag: $etag, New etag: $feed_etag");
-
-                #Store the new values in package level variables
-                $etag_info->{$sha1_feed}{prev_etag} = $etag;
-                $etag_info->{$sha1_feed}{etag} = $feed_etag;
-                $etag_info->{$sha1_feed}{set_time} = $time;
-
-                #TODO: Need to remove these after a certain period of time
-                $etag_info->{$sha1_feed}{range}{$key} = 1;
-                $etag_info->{$sha1_feed}{seen}{$etag} = 1;
-
+                
                 my @new;
                 for my $entry ($feed->entries) {
                     next unless $entry->id;
@@ -139,14 +118,6 @@ sub work_url {
                 my $entry_count = @new;
                 $self->log("In work_url, got $entry_count new entries");
                 my $payload = $self->post_payload($feed, \@new);
-                $etag_info->{$sha1_feed}{payload} = $payload;
-                my $etag_info_json = JSON::encode_json($etag_info);
-
-                Subfeedr::DataStore->new('feed_etag_info')
-                    ->set($sha1, $etag_info_json, sub { 
-                        #$self->log("set etag_info $etag_info_json");
-                        Subfeedr::DataStore->new('')->bgsave();
-                });
 
                 $self->notify($sha1, $url, $feed, $feed_etag, $etag, $time, $payload, \@new) if @new;
             } catch {
@@ -233,6 +204,8 @@ sub notify {
                                 ->new($subscriber_payload_list->{$subname}[$i]{payload});
                         push @$entries, @{$next_payload_object->{feed}{entry}};
                     }
+                    my $entry_ct = @$entries;
+                    $self->log("Get $entry_ct entries to post");
 
                     #TODO: Need to add entry ids to a package level hash to detemrine whether
                     #an entry has already been posted.  If so, return from the
